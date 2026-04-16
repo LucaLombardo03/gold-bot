@@ -198,6 +198,194 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> float:
     return value
 
 
+def try_reconnect_mt5(
+    login: int,
+    password: str,
+    server: str,
+    tg_token: str = "",
+    tg_chat: str = "",
+    max_attempts: int = 3,
+) -> bool:
+    for attempt in range(1, max_attempts + 1):
+        log.warning("Tentativo reconnect MT5 %d/%d...", attempt, max_attempts)
+        try:
+            mt5.shutdown()
+            import time as _time
+            _time.sleep(5)
+            connected = mt5.initialize(login=login, password=password, server=server)
+            if connected:
+                log.info("Reconnect MT5 riuscito al tentativo %d", attempt)
+                send_telegram(
+                    tg_token, tg_chat,
+                    f"🟢 MT5 riconnesso (tentativo {attempt}/{max_attempts})",
+                )
+                return True
+        except Exception as exc:
+            log.error("Eccezione durante reconnect tentativo %d: %s", attempt, exc)
+        import time as _time
+        _time.sleep(30)
+
+    log.critical("Reconnect MT5 fallito dopo %d tentativi", max_attempts)
+    send_telegram(
+        tg_token, tg_chat,
+        f"🔴 MT5 disconnesso — reconnect fallito dopo {max_attempts} tentativi. Bot fermato.",
+    )
+    return False
+
+
+def check_closed_trades(
+    symbol: str,
+    since: datetime.datetime,
+    notified_tickets: set,
+    tg_token: str = "",
+    tg_chat: str = "",
+) -> None:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        deals = mt5.history_deals_get(since, now, group=symbol)
+    except Exception as exc:
+        log.error("Eccezione in history_deals_get: %s", exc)
+        return
+
+    if deals is None:
+        return
+
+    for deal in deals:
+        if deal.ticket in notified_tickets:
+            continue
+        if deal.magic != MAGIC_NUMBER:
+            continue
+        if deal.entry != mt5.DEAL_ENTRY_OUT:
+            continue
+
+        notified_tickets.add(deal.ticket)
+
+        direction = "BUY" if deal.type == mt5.DEAL_TYPE_SELL else "SELL"  # exit deal type is opposite
+        net = deal.profit + deal.commission + deal.swap
+        result_emoji = "✅" if deal.profit >= 0 else "❌"
+
+        log.info(
+            "Trade chiuso | Ticket %d | %s | P&L: %.2f USD | Netto: %.2f USD",
+            deal.ticket, direction, deal.profit, net,
+        )
+        send_telegram(
+            tg_token, tg_chat,
+            f"{result_emoji} Trade chiuso\n"
+            f"{symbol} | {direction}\n"
+            f"P&L: {deal.profit:+.2f} USD\n"
+            f"Commissione: {deal.commission:.2f} | Swap: {deal.swap:.2f}\n"
+            f"Netto: {net:+.2f} USD",
+        )
+
+
+def get_daily_summary(symbol: str, day_start: datetime.datetime) -> tuple[int, float]:
+    """Restituisce (numero_trade_chiusi, pnl_totale) per la giornata corrente."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        deals = mt5.history_deals_get(day_start, now, group=symbol)
+    except Exception as exc:
+        log.error("Eccezione in history_deals_get (daily summary): %s", exc)
+        return 0, 0.0
+
+    if deals is None:
+        return 0, 0.0
+
+    count = 0
+    total_pnl = 0.0
+    for deal in deals:
+        if deal.magic != MAGIC_NUMBER:
+            continue
+        if deal.entry != mt5.DEAL_ENTRY_OUT:
+            continue
+        count += 1
+        total_pnl += deal.profit + deal.commission + deal.swap
+
+    return count, total_pnl
+
+
+def manage_breakeven(
+    symbol: str,
+    atr: float,
+    atr_mult_sl: float,
+    breakeven_activation_r: float = 1.0,
+    dry_run: bool = False,
+    tg_token: str = "",
+    tg_chat: str = "",
+) -> None:
+    try:
+        positions = mt5.positions_get(symbol=symbol)
+    except Exception as exc:
+        log.error("Eccezione in positions_get (breakeven): %s", exc)
+        return
+
+    if not positions:
+        return
+
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        log.error("symbol_info None in manage_breakeven")
+        return
+    digits = info.digits
+
+    activation_distance = atr * atr_mult_sl * breakeven_activation_r
+
+    for pos in positions:
+        direction = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
+        new_sl = round(pos.price_open, digits)
+
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            if pos.sl >= pos.price_open > 0:
+                continue  # già a breakeven o meglio
+            profit_distance = pos.price_current - pos.price_open
+        else:
+            if 0 < pos.sl <= pos.price_open:
+                continue  # già a breakeven o meglio
+            profit_distance = pos.price_open - pos.price_current
+
+        if profit_distance < activation_distance:
+            continue
+
+        if dry_run:
+            log.info(
+                "DRY RUN - breakeven non inviato | Ticket %d | SL → %.5f (entry)",
+                pos.ticket, new_sl,
+            )
+            send_telegram(
+                tg_token, tg_chat,
+                f"🔒 [DRY RUN] Breakeven\n"
+                f"Ticket: {pos.ticket} | {direction}\n"
+                f"SL → {new_sl:.5f} (entry)",
+            )
+            continue
+
+        try:
+            result = mt5.order_send({
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": symbol,
+                "sl": new_sl,
+                "tp": pos.tp,
+                "position": pos.ticket,
+            })
+        except Exception as exc:
+            log.error("Eccezione in order_send (breakeven) Ticket %d: %s", pos.ticket, exc)
+            continue
+
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            log.info("Breakeven impostato | Ticket %d | SL → %.5f", pos.ticket, new_sl)
+            send_telegram(
+                tg_token, tg_chat,
+                f"🔒 Breakeven impostato\n"
+                f"Ticket: {pos.ticket} | {direction}\n"
+                f"SL → {new_sl:.5f} (entry)",
+            )
+        else:
+            log.warning(
+                "Breakeven fallito | Ticket %d | retcode: %s",
+                pos.ticket,
+                result.retcode if result else "None",
+            )
+
+
 def manage_trailing_stop(
     symbol: str,
     atr: float,
@@ -205,6 +393,8 @@ def manage_trailing_stop(
     trail_activation_r: float,
     trail_offset_atr: float,
     dry_run: bool = False,
+    tg_token: str = "",
+    tg_chat: str = "",
 ) -> None:
     try:
         positions = mt5.positions_get(symbol=symbol)
@@ -238,11 +428,20 @@ def manage_trailing_stop(
             if pos.sl > 0 and new_sl >= pos.sl:
                 continue
 
+        direction = "BUY" if pos.type == mt5.ORDER_TYPE_BUY else "SELL"
+
         if dry_run:
             log.info(
                 "DRY RUN - trailing stop non inviato | Ticket %d | Nuovo SL: %.5f",
                 pos.ticket,
                 new_sl,
+            )
+            send_telegram(
+                tg_token, tg_chat,
+                f"🔁 [DRY RUN] Trailing stop\n"
+                f"Ticket: {pos.ticket} | {direction}\n"
+                f"Prezzo corrente: {pos.price_current:.5f}\n"
+                f"Nuovo SL: {new_sl:.5f}",
             )
             continue
 
@@ -263,6 +462,13 @@ def manage_trailing_stop(
                 "Trailing stop aggiornato | Ticket %d | Nuovo SL: %.5f",
                 pos.ticket,
                 new_sl,
+            )
+            send_telegram(
+                tg_token, tg_chat,
+                f"🔁 Trailing stop aggiornato\n"
+                f"Ticket: {pos.ticket} | {direction}\n"
+                f"Prezzo corrente: {pos.price_current:.5f}\n"
+                f"Nuovo SL: {new_sl:.5f}",
             )
         else:
             log.warning(
