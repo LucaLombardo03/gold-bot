@@ -1,0 +1,13 @@
+# Credenziali — non committare mai
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Log
+*.log
